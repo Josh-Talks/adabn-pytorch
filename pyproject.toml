@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adabn"
+version = "0.0.1"
+
+[tool.setuptools.packages.find]
+where = ["src"]  # list of folders that contain the packages (["."] by default)
+
+[tool.black]
+line-length = 88
+target-version = ["py38", "py39", "py310", "py311", "py312"]
+preview = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+exclude = [
+    "bioimageio_cache",
+    "scripts/pdoc/original.py",
+    "scripts/pdoc/patched.py",
+]
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "assert_never\\("]

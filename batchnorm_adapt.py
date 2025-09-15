@@ -2,7 +2,7 @@ import os
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
-from utils import *
+from adabn.utils import *
 
 seed_everything(42)
 
