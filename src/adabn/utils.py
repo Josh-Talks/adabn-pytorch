@@ -1,6 +1,6 @@
 import os
 
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
 import random
 import sys
@@ -15,13 +15,13 @@ from torchvision.models.resnet import resnet18
 from torchvision.models.vgg import vgg16_bn, vgg11_bn
 from functools import partial
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 # Just trying to seed everything so I don't find myself looking confused at the screen
 def seed_everything(seed: int):
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -52,11 +52,17 @@ class ImageGeneratorDataset(Dataset):
 # Simple model to understand the behavior of AdaBN passing through two BN layers
 class BasicModel(nn.Module):
 
-    def __init__(self, ):
+    def __init__(
+        self,
+    ):
         super(BasicModel, self).__init__()
-        self.layer1 = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=7, stride=2, padding=3)
+        self.layer1 = nn.Conv2d(
+            in_channels=3, out_channels=64, kernel_size=7, stride=2, padding=3
+        )
         self.bn1 = nn.BatchNorm2d(num_features=64)
-        self.layer2 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=7, stride=2, padding=3)
+        self.layer2 = nn.Conv2d(
+            in_channels=64, out_channels=64, kernel_size=7, stride=2, padding=3
+        )
         self.bn2 = nn.BatchNorm2d(num_features=64)
 
     def forward(self, x):
@@ -93,11 +99,11 @@ class BatchNormStatHook(object):
 
         if layer_name not in self.bn_stats:
             # FIXED: Initialize with proper structure for accumulation
-            self.bn_stats[layer_name] = {'mean': 0, 'var': 0, 'count': 0}
+            self.bn_stats[layer_name] = {"mean": 0, "var": 0, "count": 0}
 
         # CRITICAL FIX #1: Process INPUT tensor, not output!
         # Ensure output is not a view (avoid potential errors)
-        x = input[0].clone()  # FIXED: Use input[0] instead of output
+        x = input[0].clone().detach()  # FIXED: Use input[0] instead of output
 
         # Calculate mean and variance of the INPUT (not output)
         mean = x.mean([0, 2, 3])  # FIXED: Process input activations
@@ -107,16 +113,18 @@ class BatchNormStatHook(object):
         batch_size = x.size(0)
 
         # Initialize accumulators with correct shape on first call
-        if isinstance(self.bn_stats[layer_name]['mean'], int):
-            self.bn_stats[layer_name]['mean'] = torch.zeros_like(mean)
-            self.bn_stats[layer_name]['var'] = torch.zeros_like(var)
+        if isinstance(self.bn_stats[layer_name]["mean"], int):
+            self.bn_stats[layer_name]["mean"] = torch.zeros_like(mean)
+            self.bn_stats[layer_name]["var"] = torch.zeros_like(var)
 
         # Update accumulated statistics for this layer (keep per-channel)
-        self.bn_stats[layer_name]['mean'] += mean * batch_size  # FIXED: No .sum()!
-        self.bn_stats[layer_name]['var'] += var * batch_size  # FIXED: No .sum()!
+        self.bn_stats[layer_name]["mean"] += mean * batch_size  # FIXED: No .sum()!
+        self.bn_stats[layer_name]["var"] += var * batch_size  # FIXED: No .sum()!
 
         # This might not be required, but still saving just in-case
-        self.bn_stats[layer_name]['count'] += batch_size  # FIXED: Count samples, not channels
+        self.bn_stats[layer_name][
+            "count"
+        ] += batch_size  # FIXED: Count samples, not channels
 
 
 def compute_bn_stats(model, dataloader):
@@ -131,9 +139,19 @@ def compute_bn_stats(model, dataloader):
       dict: Dictionary containing layer names and their mean and variance statistics.
     """
 
-    # CRITICAL FIX #3: Set model to eval mode, not train mode!
+    # CRITICAL FIX #3: Set model to TRAIN mode to ensure proper statistics computation!
     original_mode = model.training
-    model.eval()  # FIXED: Changed from train() to eval()
+    model.train()  # CORRECTED: Must be train() for proper AdaBN statistics
+
+    # CRITICAL FIX #4: Temporarily disable dropout for consistent statistics
+    # Store original dropout states and set them to eval mode
+    dropout_modules = []
+    original_dropout_modes = []
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            dropout_modules.append(module)
+            original_dropout_modes.append(module.training)
+            module.eval()  # Disable dropout during statistics computation
 
     # Create a hook instance
     hook = BatchNormStatHook()
@@ -148,7 +166,7 @@ def compute_bn_stats(model, dataloader):
     try:
         # Iterate through the dataloader
         with torch.no_grad():
-            for data in dataloader:
+            for data, _ in dataloader:
                 # Forward pass (hook will accumulate statistics)
                 model(data.to(device))
 
@@ -156,16 +174,22 @@ def compute_bn_stats(model, dataloader):
         final_stats = {}
         for layer_name, stats in hook.bn_stats.items():
             # print("Found the layer!!!")
-            if stats['count'] > 0:
-                mean = stats['mean'] / stats['count']  # FIXED: Now divides tensors properly
-                var = stats['var'] / stats['count']
-                final_stats[layer_name] = {'mean': mean, 'var': var}
+            if stats["count"] > 0:
+                mean = (
+                    stats["mean"] / stats["count"]
+                )  # FIXED: Now divides tensors properly
+                var = stats["var"] / stats["count"]
+                final_stats[layer_name] = {"mean": mean, "var": var}
 
     finally:
         # FIXED: Clean up hooks to prevent memory leaks
         for handle in hook_handles:
             handle.remove()
         model.train(original_mode)  # Restore original mode
+
+        # CRITICAL FIX #4: Restore original dropout states
+        for module, original_mode in zip(dropout_modules, original_dropout_modes):
+            module.train(original_mode)
 
     # Return the accumulated statistics
     return final_stats
@@ -178,15 +202,21 @@ def replace_bn_stats(model, bn_stats):
             if name in bn_stats and isinstance(module, nn.BatchNorm2d):
                 # FIXED: Add shape verification
                 expected_shape = module.running_mean.shape
-                computed_mean = bn_stats[name]['mean']
-                computed_var = bn_stats[name]['var']
+                computed_mean = bn_stats[name]["mean"]
+                computed_var = bn_stats[name]["var"]
 
                 if computed_mean.shape != expected_shape:
-                    raise ValueError(f"Shape mismatch for {name}: expected {expected_shape}, got {computed_mean.shape}")
+                    raise ValueError(
+                        f"Shape mismatch for {name}: expected {expected_shape}, got {computed_mean.shape}"
+                    )
 
-                print('Before---------------------------------------')
+                print("Before---------------------------------------")
                 print(module.running_mean)
-                module.running_mean.data.copy_(computed_mean.to(module.running_mean.device))  # FIXED: Handle device
-                module.running_var.data.copy_(computed_var.to(module.running_var.device))
+                module.running_mean.data.copy_(
+                    computed_mean.to(module.running_mean.device)
+                )  # FIXED: Handle device
+                module.running_var.data.copy_(
+                    computed_var.to(module.running_var.device)
+                )
                 print(module.running_mean)
-                print('After---------------------------------------')
+                print("After---------------------------------------")
