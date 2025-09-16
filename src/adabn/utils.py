@@ -106,8 +106,16 @@ class BatchNormStatHook(object):
         x = input[0].clone().detach()  # FIXED: Use input[0] instead of output
 
         # Calculate mean and variance of the INPUT (not output)
-        mean = x.mean([0, 2, 3])  # FIXED: Process input activations
-        var = x.var([0, 2, 3], unbiased=False)
+        if x.dim() == 4:  # 2D: [N, C, H, W]
+            dims = [0, 2, 3]
+        elif x.dim() == 5:  # 3D: [N, C, D, H, W]
+            dims = [0, 2, 3, 4]
+        else:
+            raise ValueError(
+                f"Unsupported input dimension {x.dim()} for BatchNorm layer"
+            )
+        mean = x.mean(dims)  # FIXED: Process input activations
+        var = x.var(dims, unbiased=False)
 
         # CRITICAL FIX #2: Do NOT sum across channels! Keep per-channel info
         batch_size = x.size(0)
@@ -164,6 +172,7 @@ def compute_bn_stats(model, dataloader):
             hook_handles.append(handle)  # FIXED: Store handles for cleanup
 
     try:
+        device = next(model.parameters()).device
         # Iterate through the dataloader
         with torch.no_grad():
             for data, _ in dataloader:
@@ -220,3 +229,313 @@ def replace_bn_stats(model, bn_stats):
                 )
                 print(module.running_mean)
                 print("After---------------------------------------")
+
+
+class SequentialBatchNormStatHook(object):
+    """
+    Hook to accumulate statistics from a single BatchNorm layer during inference.
+    Used for sequential BatchNorm adaptation.
+    """
+
+    def __init__(self, target_layer_name):
+        self.target_layer_name = target_layer_name
+        self.bn_stats = {"mean": 0, "var": 0, "count": 0}
+
+    def __call__(self, module, input, output, name):
+        """
+        Hook function called during the forward pass of BatchNorm layers.
+        Only accumulates statistics for the target layer.
+
+        Args:
+            module (nn.Module): The BatchNorm layer.
+            input (torch.Tensor): Input tensor to the layer.
+            output (torch.Tensor): Output tensor from the layer.
+            name (str): Name of the layer.
+        """
+        # Only process the target layer
+        if name != self.target_layer_name:
+            return
+
+        # Process INPUT tensor to get statistics
+        x = input[0].clone().detach()
+
+        # Calculate mean and variance of the INPUT
+        if x.dim() == 4:  # 2D: [N, C, H, W]
+            dims = [0, 2, 3]
+        elif x.dim() == 5:  # 3D: [N, C, D, H, W]
+            dims = [0, 2, 3, 4]
+        else:
+            raise ValueError(
+                f"Unsupported input dimension {x.dim()} for BatchNorm layer"
+            )
+
+        mean = x.mean(dims)
+        var = x.var(dims, unbiased=False)
+        batch_size = x.size(0)
+
+        # Initialize accumulators with correct shape on first call
+        if isinstance(self.bn_stats["mean"], int):
+            self.bn_stats["mean"] = torch.zeros_like(mean)
+            self.bn_stats["var"] = torch.zeros_like(var)
+
+        # Update accumulated statistics for this layer
+        self.bn_stats["mean"] += mean * batch_size
+        self.bn_stats["var"] += var * batch_size
+        self.bn_stats["count"] += batch_size
+
+
+def get_bn_layers_ordered(model):
+    """
+    Get all BatchNorm layers in the model in the order they appear during forward pass.
+
+    Args:
+        model (nn.Module): The model to analyze.
+
+    Returns:
+        list: List of tuples (layer_name, module) for all BatchNorm layers in order.
+    """
+    bn_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.BatchNorm2d):
+            bn_layers.append((name, module))
+    return bn_layers
+
+
+def create_partial_forward_model(model, target_layer_name):
+    """
+    Create a partial model that only computes forward pass up to and including
+    the target BatchNorm layer. This is more efficient than computing the full
+    forward pass when we only need statistics up to a certain layer.
+
+    Args:
+        model (nn.Module): The original model.
+        target_layer_name (str): Name of the target BatchNorm layer.
+
+    Returns:
+        nn.Module: A partial model that stops at the target layer.
+    """
+
+    # For simple models, we'll use the full model but with early stopping
+    # In practice, you might want to create actual partial models for efficiency
+    class PartialModel(nn.Module):
+        def __init__(self, original_model, stop_at_layer):
+            super().__init__()
+            self.original_model = original_model
+            self.stop_at_layer = stop_at_layer
+            self.should_stop = False
+
+        def forward(self, x):
+            # Reset stop flag
+            self.should_stop = False
+
+            # Register a hook to stop at target layer
+            def stop_hook(module, input, output, name=self.stop_at_layer):
+                if name == self.stop_at_layer:
+                    self.should_stop = True
+                return output
+
+            # Add hook to target layer
+            hooks = []
+            for name, module in self.original_model.named_modules():
+                if name == self.stop_at_layer and isinstance(
+                    module, torch.nn.BatchNorm2d
+                ):
+                    hook = module.register_forward_hook(partial(stop_hook, name=name))
+                    hooks.append(hook)
+                    break
+
+            try:
+                # For BasicModel, we need to manually implement partial forward
+                if isinstance(self.original_model, BasicModel):
+                    x = self.original_model.layer1(x)
+                    if self.stop_at_layer == "bn1":
+                        x = self.original_model.bn1(x)
+                        return x
+                    x = self.original_model.bn1(x)
+                    x = self.original_model.layer2(x)
+                    if self.stop_at_layer == "bn2":
+                        x = self.original_model.bn2(x)
+                        return x
+                else:
+                    # For other models, use full forward (could be optimized)
+                    return self.original_model(x)
+            finally:
+                # Clean up hooks
+                for hook in hooks:
+                    hook.remove()
+
+            return x
+
+    return PartialModel(model, target_layer_name)
+
+
+def compute_single_bn_stats(model, dataloader, target_layer_name):
+    """
+    Computes mean and variance for a single BatchNorm layer across all images in the dataloader.
+    Uses a partial forward pass for efficiency when possible.
+
+    IMPORTANT: This function sets the model to eval() mode so that previously updated
+    BatchNorm layers use their updated running statistics, allowing sequential adaptation
+    where each layer sees the effects of all previously adapted layers.
+
+    Args:
+        model (nn.Module): The trained model.
+        dataloader (torch.utils.data.DataLoader): The dataloader for the data.
+        target_layer_name (str): Name of the target BatchNorm layer.
+
+    Returns:
+        dict: Dictionary containing mean and variance statistics for the target layer.
+    """
+    # Set model to EVAL mode so that:
+    # 1. Previously updated BatchNorm layers use their updated running statistics
+    # 2. Dropout is automatically disabled for consistent statistics
+    # 3. We compute statistics based on the current state of all previous layers
+    # 4. This enables true sequential adaptation where each layer sees properly adapted inputs
+    original_mode = model.training
+    model.eval()
+
+    # Create a hook instance for the target layer only
+    hook = SequentialBatchNormStatHook(target_layer_name)
+    hook_handle = None
+
+    # Register the hook only on the target BatchNorm layer
+    for name, module in model.named_modules():
+        if name == target_layer_name and isinstance(module, torch.nn.BatchNorm2d):
+            hook_handle = module.register_forward_hook(partial(hook, name=name))
+            break
+
+    if hook_handle is None:
+        raise ValueError(
+            f"Target layer '{target_layer_name}' not found or is not a BatchNorm2d layer"
+        )
+
+    try:
+        device = next(model.parameters()).device
+
+        # Create partial model for efficiency (stops computation at target layer)
+        # partial_model = create_partial_forward_model(model, target_layer_name)
+
+        # Iterate through the dataloader
+        with torch.no_grad():
+            for batch_data in dataloader:
+                if isinstance(batch_data, (list, tuple)):
+                    data = batch_data[0]  # Assume first element is input
+                else:
+                    data = batch_data
+                # Forward pass up to target layer (hook will accumulate statistics)
+                # partial_model(data.to(device))
+                model(data.to(device))
+
+        # Calculate final mean and variance for the target layer
+        final_stats = {}
+        if hook.bn_stats["count"] > 0:
+            mean = hook.bn_stats["mean"] / hook.bn_stats["count"]
+            var = hook.bn_stats["var"] / hook.bn_stats["count"]
+            final_stats[target_layer_name] = {"mean": mean, "var": var}
+
+    finally:
+        # Clean up hooks
+        if hook_handle:
+            hook_handle.remove()
+        # Restore original model mode
+        model.train(original_mode)
+
+    return final_stats
+
+
+def update_single_bn_layer(model, layer_name, bn_stats):
+    """
+    Update statistics for a single BatchNorm layer.
+
+    Args:
+        model (nn.Module): The model containing the BatchNorm layer.
+        layer_name (str): Name of the BatchNorm layer to update.
+        bn_stats (dict): Dictionary containing mean and variance statistics.
+    """
+    with torch.no_grad():
+        for name, module in model.named_modules():
+            if name == layer_name and isinstance(module, nn.BatchNorm2d):
+                if layer_name in bn_stats:
+                    # Verify shape compatibility
+                    expected_shape = module.running_mean.shape
+                    computed_mean = bn_stats[layer_name]["mean"]
+                    computed_var = bn_stats[layer_name]["var"]
+
+                    if computed_mean.shape != expected_shape:
+                        raise ValueError(
+                            f"Shape mismatch for {layer_name}: expected {expected_shape}, got {computed_mean.shape}"
+                        )
+
+                    # Update the layer's statistics
+                    module.running_mean.data.copy_(
+                        computed_mean.to(module.running_mean.device)
+                    )
+                    module.running_var.data.copy_(
+                        computed_var.to(module.running_var.device)
+                    )
+
+                    print(f"Updated BatchNorm layer '{layer_name}' with new statistics")
+                break
+
+
+def sequential_bn_adaptation(model, dataloader, verbose=True):
+    """
+    Sequentially update BatchNorm statistics layer by layer.
+    Each layer is updated based on the outputs of previously updated layers.
+
+    Args:
+        model (nn.Module): The trained model.
+        dataloader (torch.utils.data.DataLoader): The dataloader for target domain data.
+        verbose (bool): Whether to print progress information.
+
+    Returns:
+        dict: Dictionary containing final statistics for all updated layers.
+    """
+    # Get all BatchNorm layers in order
+    bn_layers = get_bn_layers_ordered(model)
+
+    if not bn_layers:
+        if verbose:
+            print("No BatchNorm layers found in the model")
+        return {}
+
+    if verbose:
+        print(
+            f"Found {len(bn_layers)} BatchNorm layers: {[name for name, _ in bn_layers]}"
+        )
+        print("Starting sequential BatchNorm adaptation...")
+
+    all_updated_stats = {}
+
+    # Process each BatchNorm layer sequentially
+    for i, (layer_name, layer_module) in enumerate(bn_layers):
+        if verbose:
+            print(f"\nStep {i+1}/{len(bn_layers)}: Processing layer '{layer_name}'")
+
+        # Compute statistics for current layer using current model state
+        layer_stats = compute_single_bn_stats(model, dataloader, layer_name)
+
+        if layer_stats:
+            # Update the current layer with new statistics
+            update_single_bn_layer(model, layer_name, layer_stats)
+            all_updated_stats.update(layer_stats)
+
+            if verbose:
+                mean_val = layer_stats[layer_name]["mean"]
+                var_val = layer_stats[layer_name]["var"]
+                print(
+                    f"  Updated '{layer_name}' - Mean range: [{mean_val.min():.4f}, {mean_val.max():.4f}]"
+                )
+                print(
+                    f"  Updated '{layer_name}' - Var range: [{var_val.min():.4f}, {var_val.max():.4f}]"
+                )
+        else:
+            if verbose:
+                print(f"  Warning: No statistics computed for layer '{layer_name}'")
+
+    if verbose:
+        print(
+            f"\nSequential BatchNorm adaptation completed. Updated {len(all_updated_stats)} layers."
+        )
+
+    return all_updated_stats
